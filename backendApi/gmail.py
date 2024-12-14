@@ -6,6 +6,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from bs4 import BeautifulSoup
 
 # If modifying these SCOPES, delete the file token.json.
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
@@ -32,6 +33,29 @@ class GmailClient:
                 token.write(creds.to_json())
         return build('gmail', 'v1', credentials=creds)
 
+    def _parse_email_content(self, parts):
+        for part in parts:
+            mime_type = part.get('mimeType', '')
+
+            # Parsing für 'text/plain' und 'text/html'
+            if mime_type in ['text/plain', 'text/html']:
+                if 'body' in part and 'data' in part['body']:
+                    data = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
+                    if mime_type == 'text/plain':
+                        return data
+                    if mime_type == 'text/html':
+                        soup = BeautifulSoup(data, 'html.parser')
+                        return soup.get_text()  # HTML gefunden und geparst, Suche stoppen
+
+        # Falls kein Inhalt gefunden, suche rekursiv
+        for part in parts:
+            if 'parts' in part:
+                data = self._parse_email_content(part['parts'])
+                if data:
+                    return data
+
+        return ''
+
     def fetch_emails(self, max_results, query=None, label_id=None) -> List[dict]:
         """Fetch emails from Gmail inbox."""
         try:
@@ -45,22 +69,22 @@ class GmailClient:
 
             emails = []
             for message in messages:
-                msg = self.service.users().messages().get(userId='me', id=message['id']).execute()
-                payload = msg.get('payload', {})
-                headers = payload.get('headers', [])
+                try:
+                    msg = self.service.users().messages().get(userId='me', id=message['id']).execute()
+                    payload = msg.get('payload', {})
+                    headers = payload.get('headers', [])
 
-                subject = next((header['value'] for header in headers if header['name'] == 'Subject'), 'No Subject')
-                body = ''
+                    subject = next((header['value'] for header in headers if header['name'] == 'Subject'), 'No Subject')
+                    body = ''
 
-                if 'parts' in payload:
-                    for part in payload['parts']:
-                        if part['mimeType'] == 'text/plain' and 'data' in part['body']:
-                            body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
-                            break
+                    if 'parts' in payload:
+                        body = self._parse_email_content(payload['parts'])
 
-                emails.append({'title': subject, 'content': body})
+                    emails.append({'title': subject, 'content': body})
+                except Exception as e:
+                    print(f"Fehler beim Verarbeiten der E-Mail mit der ID {message['id']}: {str(e)}")
 
             return emails
         except HttpError as error:
-            print(f'An error occurred: {error}')
+            print(f'Ein Fehler ist aufgetreten: {error}')
             return []

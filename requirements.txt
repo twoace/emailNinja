@@ -5,6 +5,11 @@ pydantic
 SQLAlchemy
 transformers
 numpy
-google-auth>=2.17.3
-google-auth-oauthlib>=1.0.0
-google-api-python-client>=2.92.0
+google-auth
+google-auth-oauthlib
+google-api-python-client
+scikit-learn
+nlpaug
+nltk
+beautifulsoup4
+langdetect

@@ -21,6 +21,24 @@ const TrainingMode: React.FC<TrainingModeProps> = ({
                                                        totalEmails,
                                                        fetchEmails,
                                                    }) => {
+
+    const countLabels = (): Record<number, number> => {
+        const labelCounts: Record<number, number> = {};
+        classifications.forEach((classification) => {
+            labelCounts[classification.label] = 0;
+        });
+
+        trainingEmails.forEach((email) => {
+            if (email.user_label !== null) {
+                labelCounts[email.user_label] = (labelCounts[email.user_label] || 0) + 1;
+            }
+        });
+
+        return labelCounts;
+    };
+
+    const labelCounts = countLabels();
+
     const labelEmail = async (emailId: number, label: number) => {
         try {
             await axios.post(`http://127.0.0.1:8000/emails/${emailId}/label`, {
@@ -61,13 +79,17 @@ const TrainingMode: React.FC<TrainingModeProps> = ({
             </h5>
             <div className="mb-1">
                 {classifications.map((classification) => (
-                    <button
-                        key={classification.label}
-                        className="btn btn-outline-primary me-2"
-                        onClick={() => labelEmail(currentEmail.id, classification.label)}
-                    >
-                        {classification.description}
-                    </button>
+                    <div key={classification.label}>
+                        <button
+                            className="btn btn-outline-primary me-2"
+                            onClick={() => labelEmail(currentEmail.id, classification.label)}
+                        >
+                            {classification.description}
+                        </button>
+                        <span className="ms-2">
+                            {labelCounts[classification.label] || 0} Zuordnungen
+                        </span>
+                    </div>
                 ))}
             </div>
             <div className="card mb-3">

@@ -11,6 +11,10 @@ from sqlalchemy.orm import sessionmaker, Session
 import numpy as np
 import json
 from .gmail import GmailClient
+from .helper import truncate_content, synthesize_training_data
+from sklearn.model_selection import train_test_split
+from nlpaug.augmenter.word import SynonymAug
+import nltk
 
 # Datenbank einrichten
 DATABASE_URL = "sqlite:///./emails.db"
@@ -41,11 +45,12 @@ class ClassificationDB(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# Lokale Pfade für Modelle
+# Lokale Pfade für Modelle und NLTK
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 MODEL_PATH = os.path.join(MODEL_DIR, "distilbert_email_classifier")
 TOKENIZER_PATH = os.path.join(MODEL_DIR, "distilbert_tokenizer")
+NLTK_PATH = os.path.join(MODEL_DIR, "nltk_data")
 
 # Hugging Face Modelle laden
 if not os.path.exists(MODEL_PATH):
@@ -60,6 +65,34 @@ else:
     print("DistilBERT-Modell bereits vorhanden.")
     tokenizer = DistilBertTokenizer.from_pretrained(TOKENIZER_PATH)
     model = TFDistilBertModel.from_pretrained(MODEL_PATH)
+
+# Callbacks für das Training
+EarlyStopping = tf.keras.callbacks.EarlyStopping(
+    monitor="val_loss",
+    patience=3,
+    restore_best_weights=True
+)
+ModelCheckpoint = tf.keras.callbacks.ModelCheckpoint(
+    filepath=os.path.join(MODEL_DIR, "best_model"),
+    monitor="val_loss",
+    save_best_only=True,
+    save_format="tf"
+)
+ReduceLROnPlateau = tf.keras.callbacks.ReduceLROnPlateau(
+    monitor="val_loss",
+    factor=0.2,
+    patience=2
+)
+
+# Helper zur Synthetisierung von Trainingsdaten
+os.makedirs(NLTK_PATH, exist_ok=True)
+nltk.data.path.append(NLTK_PATH)
+nltk.download('wordnet', download_dir=NLTK_PATH)
+nltk.download('omw-1.4', download_dir=NLTK_PATH)
+SYNONYM_AUG = {
+    'de': SynonymAug(aug_src='wordnet', lang='deu'),
+    'en': SynonymAug(aug_src='wordnet', lang='eng')
+}
 
 app = FastAPI()
 
@@ -137,9 +170,12 @@ def add_emails(emails: List[EmailCreate], db: Session = Depends(get_db)):
 # Endpunkt: Neue E-Mails von Gmail abrufen und hinzufügen
 @app.post("/emails/gmail")
 def add_gmail_emails(db: Session = Depends(get_db)):
-    email_dict_list = gmail.fetch_emails(100, 'category:promotions')
-    email_dict_list.extend(gmail.fetch_emails(100, label_id='INBOX'))
-    email_db_list = [EmailDB(title=email["title"], content=email["content"]) for email in email_dict_list]
+    email_dict_list = gmail.fetch_emails(200, label_id='INBOX')
+    email_db_list = [
+        EmailDB(title=email["title"],
+                content=truncate_content(email["content"], 200))
+        for email in email_dict_list
+    ]
     db.add_all(email_db_list)  # Objekte in die Session hinzufügen
     db.commit()  # Speichern in der Datenbank
     for email in email_db_list:
@@ -200,11 +236,38 @@ def train_model(db: Session = Depends(get_db)):
     if not emails:
         raise HTTPException(status_code=400, detail="Keine neuen Trainingsdaten verfügbar")
 
-    texts = [f"{email.title} {email.content}" for email in emails]
-    labels = [email.user_label for email in emails]
+    # Original Texte
+    texts = [f"{email['title']}: {email['content']}" for email in emails]
 
-    inputs = tokenizer(
-        texts,
+    # Original Labels
+    labels = [email['user_label'] for email in emails]
+
+    # Erweiterung um synthetische Daten
+    for email in emails:
+        original_text = f"{email['title']}: {email['content']}"
+        synthetic_texts = synthesize_training_data(original_text, SYNONYM_AUG)
+
+        # Füge die synthetischen Texte hinzu
+        texts.extend(synthetic_texts)
+
+        # Füge für jeden synthetischen Text das entsprechende Label hinzu
+        labels.extend([email['user_label']] * len(synthetic_texts))
+
+    # Daten in Trainings- und Validierungssets aufteilen
+    train_texts, val_texts, train_labels, val_labels = train_test_split(
+        texts, labels, test_size=0.2, random_state=42
+    )
+
+    # Tokenisierung
+    train_inputs = tokenizer(
+        train_texts,
+        return_tensors="tf",
+        padding="max_length",
+        truncation=True,
+        max_length=512
+    )
+    val_inputs = tokenizer(
+        val_texts,
         return_tensors="tf",
         padding="max_length",
         truncation=True,
@@ -216,7 +279,9 @@ def train_model(db: Session = Depends(get_db)):
     if num_classes <= 1:
         raise HTTPException(status_code=400, detail="Zu wenige Klassifikationen in der Datenbank gefunden.")
 
-    labels_one_hot = tf.keras.utils.to_categorical(labels, num_classes=num_classes)
+    # Labels in One-Hot-Encoding umwandeln
+    train_labels_one_hot = tf.keras.utils.to_categorical(train_labels, num_classes=num_classes)
+    val_labels_one_hot = tf.keras.utils.to_categorical(val_labels, num_classes=num_classes)
 
     # Fine-Tuning des DistilBERT-Modells vorbereiten
     input_ids = tf.keras.Input(shape=(512,), dtype=tf.int32, name="input_ids")
@@ -231,11 +296,13 @@ def train_model(db: Session = Depends(get_db)):
 
     # Trainieren mit Fine-Tuning
     fine_tuning_model.fit(
-        [inputs["input_ids"], inputs["attention_mask"]],
-        labels_one_hot,
-        epochs=5,
+        [train_inputs["input_ids"], train_inputs["attention_mask"]],
+        train_labels_one_hot,
+        epochs=15,
         batch_size=5,
-        shuffle=True
+        shuffle=True,
+        validation_data=([val_inputs["input_ids"], val_labels["attention_mask"]], val_labels_one_hot),
+        callbacks=[ModelCheckpoint, EarlyStopping, ReduceLROnPlateau]
     )
 
     fine_tuning_model.save(os.path.join(MODEL_DIR, "fine_tuned_classifier_model"), save_format="tf")
